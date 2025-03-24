@@ -2,8 +2,22 @@ import os
 import re
 import logging
 import html
+import threading
+import time
+import requests
 from telegram import Update, ParseMode, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, CallbackQueryHandler
+import http.server
+import socketserver
+from threading import Thread
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Load environment variables from .env file if it exists (for local development)
+env_path = Path('.') / '.env'
+if env_path.exists():
+    load_dotenv(dotenv_path=env_path)
+    logging.info("Loaded environment variables from .env file")
 
 # Enable logging
 logging.basicConfig(
@@ -11,12 +25,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Bot token
-TOKEN = "7906761490:AAFbbEV5znYVdFUw-F2auPWcyj1k7bBauzw"
+# Bot token from environment or fallback to hardcoded (not recommended for production)
+TOKEN = os.environ.get("TOKEN", "7906761490:AAFbbEV5znYVdFUw-F2auPWcyj1k7bBauzw")
 
 # Modern welcome message with bot info
 WELCOME_MESSAGE = """
-✨ <b>Welcome to SmartURL Bot</b> ✨
+✨ <b>Welcome to AppxExtractor Bot</b> ✨
 
 I transform your educational links into organized, accessible formats.
 
@@ -530,6 +544,65 @@ def process_message(update: Update, context: CallbackContext) -> None:
             parse_mode=ParseMode.HTML
         )
 
+def keep_alive():
+    """Send a request to the app URL every 50 seconds to prevent inactivity."""
+    def ping_server():
+        app_url = os.environ.get('RENDER_EXTERNAL_URL', 'your-app-name.onrender.com')
+        ping_url = f"https://{app_url}"
+        
+        logger.info("Starting keep-alive service to ping every 50 seconds")
+        
+        while True:
+            try:
+                logger.info("Pinging server to keep alive...")
+                requests.get(ping_url)
+                logger.info("Ping successful")
+            except Exception as e:
+                logger.error(f"Error pinging server: {e}")
+            
+            # Wait for 50 seconds before the next ping
+            time.sleep(50)
+    
+    # Start the ping thread
+    ping_thread = threading.Thread(target=ping_server)
+    ping_thread.daemon = True  # This will allow the thread to exit when main program exits
+    ping_thread.start()
+    logger.info("Keep-alive service started in background thread")
+
+def start_web_server(port):
+    """Start a simple web server to respond to health checks."""
+    class SimpleHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == '/':
+                self.send_response(200)
+                self.send_header('Content-type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b'Bot is running!')
+            else:
+                self.send_response(404)
+                self.send_header('Content-type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b'Not Found')
+            return
+        
+        # Suppress logs for cleaner output
+        def log_message(self, format, *args):
+            if '/favicon.ico' not in args[0]:  # Skip favicon requests
+                logger.info(f"Health check request: {args[0]}")
+    
+    # Use ThreadingHTTPServer to handle multiple requests
+    class ThreadedHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+        allow_reuse_address = True
+    
+    server = ThreadedHTTPServer(('0.0.0.0', port), SimpleHTTPRequestHandler)
+    logger.info(f'Starting health check server on port {port}')
+    
+    # Run server in a separate thread
+    server_thread = Thread(target=server.serve_forever)
+    server_thread.daemon = True
+    server_thread.start()
+    logger.info(f'Health check server started on port {port}')
+
 def main() -> None:
     """Start the bot."""
     # Create the Updater and pass it your bot's token
@@ -550,8 +623,43 @@ def main() -> None:
     # Message handler
     dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, process_message))
 
-    # Start the Bot
-    updater.start_polling()
+    # Start the keep alive ping service
+    keep_alive()
+    
+    # Set up webhook for Render deployment or polling for local development
+    PORT = int(os.environ.get('PORT', 8080))
+    
+    # Check if we're running in production mode
+    if os.environ.get('ENVIRONMENT') == 'production':
+        # Start a simple web server for health checks on PORT
+        # Note: The web server only handles health check endpoints
+        # The Telegram webhook listens on a different path
+        start_web_server(PORT)
+        
+        # Use webhook when deployed to Render
+        WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
+        if not WEBHOOK_URL:
+            # If WEBHOOK_URL is not set, construct it from RENDER_EXTERNAL_URL
+            render_url = os.environ.get('RENDER_EXTERNAL_URL', 'your-app-name.onrender.com')
+            WEBHOOK_URL = f"https://{render_url}/{TOKEN}"
+        
+        logger.info(f"Starting webhook on port {PORT} with URL: {WEBHOOK_URL}")
+        
+        # Start the Bot using webhooks for production
+        # The webhook listens on the same port but at path /{TOKEN}
+        updater.start_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=TOKEN,
+            webhook_url=WEBHOOK_URL
+        )
+        logger.info(f"Bot started in webhook mode on port {PORT}")
+    else:
+        # For local development, just use polling and no health check server
+        updater.start_polling()
+        logger.info("Bot started in polling mode")
+
+    # Run the bot until you press Ctrl-C
     updater.idle()
 
 if __name__ == '__main__':
